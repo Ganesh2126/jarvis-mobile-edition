@@ -1,45 +1,158 @@
-// ===== 1. API KEY =====
-let API_KEY = localStorage.getItem('jarvis_key');
-if (!API_KEY) {
-  API_KEY = prompt('Enter your Gemini API Key:');
-  if (API_KEY) localStorage.setItem('jarvis_key', API_KEY);
+// ===== 1. SETTINGS + GEMINI CLIENT =====
+const SETTINGS_KEY = 'jarvis_settings_v2';
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+// Verified against Google's model list (Nov 2026). Blank model in Settings = auto.
+const DEFAULT_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+
+let SETTINGS = { apiKey: '', model: '', userName: 'BOSS', voiceLang: 'en-IN' };
+try { SETTINGS.apiKey = localStorage.getItem('jarvis_key') || ''; } catch (e) {}
+try { Object.assign(SETTINGS, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')); } catch (e) {}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETTINGS));
+    if (SETTINGS.apiKey) localStorage.setItem('jarvis_key', SETTINGS.apiKey);
+  } catch (e) {}
 }
 
-function extractInteractionText(data) {
-  if (typeof data?.output_text === 'string' && data.output_text.trim()) return data.output_text.trim();
-  const steps = Array.isArray(data?.steps) ? data.steps : Array.isArray(data?.outputs) ? data.outputs : [];
-  return steps
-    .filter(step => step && (step.type === 'model_output' || step.type === 'text' || !step.type))
-    .flatMap(step => Array.isArray(step.content) ? step.content : typeof step.text === 'string' ? [{ type: 'text', text: step.text }] : [])
-    .filter(part => part && (part.type === 'text' || typeof part.text === 'string') && typeof part.text === 'string')
-    .map(part => part.text)
-    .join('\n')
-    .trim();
+function geminiSystemInstruction() {
+  return 'You are J.A.R.V.I.S, a friendly personal assistant for ' + (SETTINGS.userName || 'the user') +
+    '. Reply in the same language the user writes in (Telugu, English, or a natural Telugu-English mix). ' +
+    'Keep answers clear and concise. If you do not know, say so plainly.';
 }
 
-async function requestGeminiInteraction(input, systemInstruction = GEMINI_SYSTEM_INSTRUCTION) {
-  if (!API_KEY) throw new Error('Gemini API key is missing. Reload the page and enter it again.');
-  const payload = { model: GEMINI_MODEL, input, store: false };
-  if (systemInstruction) payload.system_instruction = systemInstruction;
-  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': API_KEY,
-      'Api-Revision': '2026-05-20'
-    },
-    body: JSON.stringify(payload)
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data?.error) {
-    throw new Error(data?.error?.message || 'Gemini request failed (' + response.status + ').');
+class GeminiError extends Error {
+  constructor(message, status = 0, flags = {}) {
+    super(message);
+    this.name = 'GeminiError';
+    this.status = status;
+    this.retryable = false;
+    this.keyProblem = false;
+    this.network = false;
+    Object.assign(this, flags);
   }
-  const reply = extractInteractionText(data);
-  if (!reply) throw new Error(data?.status === 'failed' ? 'Gemini could not complete this request.' : 'Gemini returned an empty response.');
-  return reply;
 }
-const GEMINI_MODEL = 'gemini-3.8-flash';
-const GEMINI_SYSTEM_INSTRUCTION = 'You are J.A.R.V.I.S, a friendly personal assistant for Ganesh. Reply naturally in a warm Telugu-English mix, using clear concise language. If you do not know, say so plainly.';
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+let discoveredModels = null;
+let lastGeminiModel = '';
+
+async function geminiFetch(url, options, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new GeminiError('Gemini reply chala late ayyindi (timeout).', 0, { retryable: true });
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) throw new GeminiError('Internet ledu. Network check chesi malli try cheyyi.', 0, { network: true });
+    throw new GeminiError('Gemini server ki connect avvaledu (network / adblock / VPN issue). Wi-Fi leda data marchi try cheyyi.', 0, { network: true });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function geminiModelList() {
+  const list = [];
+  if (SETTINGS.model) list.push(SETTINGS.model);
+  DEFAULT_MODELS.forEach(m => list.push(m));
+  if (discoveredModels) discoveredModels.forEach(m => list.push(m));
+  return [...new Set(list)];
+}
+
+// Asks Google which models this key can use (used only if the known names return 404).
+async function discoverModels() {
+  if (discoveredModels) return discoveredModels;
+  const res = await geminiFetch(GEMINI_BASE + '/models?pageSize=100', { headers: { 'x-goog-api-key': SETTINGS.apiKey } }, 15000);
+  const data = await res.json().catch(() => ({}));
+  const version = n => parseFloat((n.match(/gemini-([\d.]+)/) || [])[1]) || 0;
+  const names = (data.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => String(m.name || '').replace(/^models\//, ''))
+    .filter(n => /^gemini-[\d.]+-flash/.test(n) && !/tts|live|image|audio|transcribe|robotics|preview|exp/.test(n));
+  names.sort((a, b) => version(b) - version(a) || (/lite/.test(a) - /lite/.test(b)));
+  discoveredModels = names;
+  return names;
+}
+
+async function callModel(model, body) {
+  const url = GEMINI_BASE + '/models/' + encodeURIComponent(model) + ':generateContent';
+  const res = await geminiFetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': SETTINGS.apiKey },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const raw = (data && data.error && data.error.message) || ('HTTP ' + res.status);
+    let message = 'Gemini error ' + res.status + ': ' + raw;
+    let keyProblem = false;
+    if ((res.status === 400 && /api key/i.test(raw)) || res.status === 401 || res.status === 403) {
+      message = 'API key problem (' + res.status + '). Settings lo sariyaina Gemini key pettu. ' + raw;
+      keyProblem = true;
+    } else if (res.status === 429) message = 'Gemini limit/quota ayyindi (429). Konchem sepu aagi try cheyyi.';
+    else if (res.status === 404) message = 'Model "' + model + '" dorakaledu (404).';
+    else if (res.status >= 500) message = 'Gemini server busy (' + res.status + ').';
+    throw new GeminiError(message, res.status, { retryable: res.status === 429 || res.status >= 500, keyProblem });
+  }
+  const candidate = data && data.candidates && data.candidates[0];
+  const text = ((candidate && candidate.content && candidate.content.parts) || []).map(p => p.text || '').join('').trim();
+  if (!text) {
+    const why = (data && data.promptFeedback && data.promptFeedback.blockReason) || (candidate && candidate.finishReason) || 'empty';
+    throw new GeminiError('Gemini nunchi reply raledu (' + why + '). Vere vidhanga adugu.', 200);
+  }
+  return text;
+}
+
+// contents = [{ role: 'user'|'model', parts: [{ text } | { inlineData }] }]
+async function requestGemini(contents, system = geminiSystemInstruction()) {
+  if (!SETTINGS.apiKey) {
+    if (typeof openSettings === 'function') openSettings();
+    throw new GeminiError('Gemini API key ledu. Settings lo key pettu.', 0, { keyProblem: true });
+  }
+  const body = { contents };
+  if (system) body.systemInstruction = { parts: [{ text: system }] };
+  const tried = new Set();
+
+  const run = async models => {
+    let last = null;
+    for (const model of models) {
+      if (tried.has(model)) continue;
+      tried.add(model);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const text = await callModel(model, body);
+          lastGeminiModel = model;
+          return { text };
+        } catch (e) {
+          if (!(e instanceof GeminiError)) throw e;
+          last = e;
+          if (e.network) {
+            if (attempt === 1) throw e;
+            await sleep(1200);
+            continue;
+          }
+          if (e.status === 404) break;
+          if (!e.retryable) throw e;
+          await sleep(900 * (attempt + 1));
+        }
+      }
+    }
+    return { error: last };
+  };
+
+  let out = await run(geminiModelList());
+  if (out.text) return out.text;
+  if (out.error && out.error.status === 404 && !discoveredModels) {
+    try {
+      await discoverModels();
+      out = await run(geminiModelList());
+      if (out.text) return out.text;
+    } catch (e) {
+      if (e instanceof GeminiError && (e.network || e.keyProblem)) throw e;
+    }
+  }
+  throw out.error || new GeminiError('Gemini ippudu available ledu. Konchem sepu tarvata try cheyyi.');
+}
 
 // ===== 2. MEMORY =====
 let MEMORY = [];
@@ -202,7 +315,7 @@ function activityLabel(text) {
 
 function isTransientActivity(text) {
   const clean = String(text).replace(/^J\.A\.R\.V\.I\.S:\s*/i, '');
-  return /^(?:Thinking\.\.\.|Agent mode active\.|Goal analyze\b|\[\d+\/\d+\].*tool run chesthunna|Results combine chesthunna|Gemini busy undi;)/i.test(clean);
+  return /^(?:Thinking\.\.\.|Agent mode active\.|Goal analyze\b|\[\d+\/\d+\].*tool run chesthunna|Results combine chesthunna|Gemini available ledu;)/i.test(clean);
 }
 
 function closeSidebarOnMobile() {
@@ -276,6 +389,7 @@ function startNewConversation() {
 }
 
 function openSettings() {
+  if (typeof fillSettingsFields === 'function') fillSettingsFields();
   settingsPanel.hidden = false;
   settingsScrim.hidden = false;
   closeSidebarOnMobile();
@@ -377,21 +491,33 @@ async function handleTools(text) {
   }
 
   if (t.includes('weather') || t.includes('వాతావరణం')) {
-    if (!navigator.geolocation) return 'I need location permission for weather, Boss.';
-    return await new Promise(resolve => {
-      navigator.geolocation.getCurrentPosition(async position => {
+    const getCoords = () => new Promise(resolve => {
+      const viaIp = async () => {
         try {
-          const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + position.coords.latitude + '&longitude=' + position.coords.longitude + '&current_weather=true';
-          const data = await fetchToolJson(url);
-          const temperatureValue = data?.current_weather?.temperature ?? data?.current?.temperature_2m;
-          const temperature = Number(temperatureValue);
-          if (temperatureValue === null || temperatureValue === undefined || !Number.isFinite(temperature)) throw new Error('Weather data unavailable.');
-          resolve('It is ' + temperature + ' degrees Celsius now, Boss.');
-        } catch (e) {
-          resolve('Weather service error, Boss.');
-        }
-      }, () => resolve('I need location permission for weather, Boss.'), { timeout: 10000, maximumAge: 300000 });
+          const d = await fetchToolJson('https://ipwho.is/', {}, 8000);
+          const lat = Number(d?.latitude), lon = Number(d?.longitude);
+          resolve(d && d.success !== false && Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null);
+        } catch (e) { resolve(null); }
+      };
+      if (!navigator.geolocation) { viaIp(); return; }
+      navigator.geolocation.getCurrentPosition(
+        position => resolve({ lat: position.coords.latitude, lon: position.coords.longitude }),
+        viaIp,
+        { timeout: 8000, maximumAge: 300000 }
+      );
     });
+    const where = await getCoords();
+    if (!where) return 'I need location permission for weather, Boss.';
+    try {
+      const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + where.lat + '&longitude=' + where.lon + '&current_weather=true';
+      const data = await fetchToolJson(url);
+      const temperatureValue = data?.current_weather?.temperature ?? data?.current?.temperature_2m;
+      const temperature = Number(temperatureValue);
+      if (temperatureValue === null || temperatureValue === undefined || !Number.isFinite(temperature)) throw new Error('Weather data unavailable.');
+      return 'It is ' + temperature + ' degrees Celsius now, Boss.';
+    } catch (e) {
+      return 'Weather service error, Boss.';
+    }
   }
 
   const timerCommand = t.includes('timer') || t.includes('టైమర్');
@@ -404,7 +530,13 @@ async function handleTools(text) {
     const factor = /^(?:h|hr|hrs|hour|hours|గంట|గంటలు)/.test(unit) ? 3600000 : /^(?:s|sec|secs|second|seconds|సెకను|సెకన్లు)/.test(unit) ? 1000 : 60000;
     const duration = amount * factor;
     if (duration > 86400000) return 'Timer limit is 24 hours.';
-    setTimeout(() => speakWithWakePause('టైమర్ పూర్తైంది! ' + amount + ' ' + unit + ' అయ్యాయి.'), duration);
+    const endAt = Date.now() + duration;
+    const timerCheck = setInterval(() => {
+      if (Date.now() < endAt) return;
+      clearInterval(timerCheck);
+      add('J.A.R.V.I.S: ⏰ Timer complete: ' + amount + ' ' + unit, 'ai', true);
+      speakWithWakePause('టైమర్ పూర్తైంది! ' + amount + ' ' + unit + ' అయ్యాయి.');
+    }, 1000);
     return 'Timer set for ' + amount + ' ' + unit + '.';
   }
 
@@ -572,8 +704,9 @@ function parseAgentToolPlan(responseText) {
 }
 
 function isTemporaryGeminiError(error) {
+  if (error instanceof GeminiError) return !error.keyProblem;
   const message = String(error?.message || error || '');
-  return /high demand|temporar|quota|rate.?limit|overload|unavailable|no longer available|429|503|5\d\d|failed to fetch|network error|unknown model|model.*(?:not found|unavailable|unsupported)/i.test(message);
+  return /high demand|temporar|quota|rate.?limit|overload|unavailable|429|503|5\d\d|failed to fetch|network error/i.test(message);
 }
 
 function fallbackAgentToolPlan(goal) {
@@ -588,14 +721,12 @@ function fallbackAgentToolPlan(goal) {
 }
 
 function localAgentSummary(results) {
-  const details = Object.entries(results).map(([tool, result]) => tool + ': ' + String(result)).join(' ');
-  return details ? 'Gemini busy undi, kani available tools nunchi dorikina briefing idi: ' + details : 'Gemini ippudu busy ga undi; live results dorakaledu. Konchem sepu tarvata malli try cheyyi.';
+  const details = Object.entries(results).map(([tool, result]) => '• ' + tool + ': ' + String(result)).join('\n');
+  return details ? 'Gemini ippudu available ledu, kani tools nunchi dorikina briefing idi:\n' + details : 'Gemini ippudu available ledu; live results dorakaledu. Konchem sepu tarvata malli try cheyyi.';
 }
 
 async function callGeminiRaw(prompt) {
-  return requestGeminiInteraction([
-    { type: 'user_input', content: [{ type: 'text', text: String(prompt) }] }
-  ], '');
+  return requestGemini([{ role: 'user', parts: [{ text: String(prompt) }] }], '');
 }
 
 async function runAgent(goal) {
@@ -609,7 +740,7 @@ async function runAgent(goal) {
     if (!isTemporaryGeminiError(error)) throw error;
     toolsToRun = fallbackAgentToolPlan(goal);
     if (!toolsToRun.length) throw error;
-    add('J.A.R.V.I.S: Gemini busy undi; safe tool fallback use chesthunna.', 'ai');
+    add('J.A.R.V.I.S: Gemini available ledu; safe tool fallback use chesthunna.', 'ai');
   }
   if (!toolsToRun.length) throw new Error('Ee request ki available tools match avvaledu; emi run cheyyaledu.');
   const results = {};
@@ -629,19 +760,19 @@ async function runAgent(goal) {
     return await callGemini(summaryPrompt);
   } catch (error) {
     if (!isTemporaryGeminiError(error)) throw error;
-    add('J.A.R.V.I.S: Gemini busy undi; available tool results tho reply chesthunna.', 'ai');
+    add('J.A.R.V.I.S: Gemini available ledu; available tool results tho reply chesthunna.', 'ai');
     return localAgentSummary(results);
   }
 }
-
 // ===== 4. GEMINI BRAIN =====
 async function callGemini(p) {
   const history = MEMORY.slice(-12).map(message => ({
-    type: message.role === 'user' ? 'user_input' : 'model_output',
-    content: [{ type: 'text', text: message.text }]
+    role: message.role === 'user' ? 'user' : 'model',
+    parts: [{ text: message.text }]
   }));
-  history.push({ type: 'user_input', content: [{ type: 'text', text: p }] });
-  return requestGeminiInteraction(history);
+  while (history.length && history[0].role !== 'user') history.shift();
+  history.push({ role: 'user', parts: [{ text: p }] });
+  return requestGemini(history);
 }
 
 function telugishToolReply(r) {
@@ -769,18 +900,39 @@ async function askGemini(p) {
 
 // ===== 5. VISION =====
 camBtn.onclick = () => imgInput.click();
-imgInput.onchange = () => {
+
+function shrinkImage(file, maxSide = 1280) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', 0.85).split(',')[1]);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image load avvaledu.')); };
+    img.src = url;
+  });
+}
+
+imgInput.onchange = async () => {
   const file = imgInput.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    const base64 = reader.result.split(',')[1];
-    const q = input.value.trim() || 'What do you see? Describe briefly.';
-    add('YOU: [IMAGE] ' + q, 'user');
-    input.value = '';
-    askVision(base64, file.type || 'image/jpeg', q);
-  };
-  reader.readAsDataURL(file);
+  const q = input.value.trim() || 'What do you see? Describe briefly.';
+  add('YOU: [IMAGE] ' + q, 'user');
+  input.value = '';
+  try {
+    const base64 = await shrinkImage(file);
+    imgInput.value = '';
+    askVision(base64, 'image/jpeg', q);
+  } catch (e) {
+    imgInput.value = '';
+    add('J.A.R.V.I.S: ERROR - ' + (e?.message || 'Image read avvaledu.'), 'ai', true);
+  }
 };
 
 async function askVision(base64, mime, q) {
@@ -788,9 +940,8 @@ async function askVision(base64, mime, q) {
   setJarvisVisualState('THINKING');
   const replyNode = add('J.A.R.V.I.S: Analyzing image...', 'ai', true);
   try {
-    const reply = await requestGeminiInteraction([
-      { type: 'text', text: q },
-      { type: 'image', data: base64, mime_type: mime || 'image/jpeg' }
+    const reply = await requestGemini([
+      { role: 'user', parts: [{ text: q }, { inlineData: { mimeType: mime || 'image/jpeg', data: base64 } }] }
     ]);
     setReply(replyNode, 'J.A.R.V.I.S: ' + reply);
     setJarvisVisualState('SPEAKING');
@@ -821,7 +972,7 @@ let recognitionActive = false;
 let recognitionMode = 'manual';
 let wakeRestartTimer = null;
 
-if (rec) rec.lang = 'en-IN';
+if (rec) rec.lang = SETTINGS.voiceLang || 'en-IN';
 
 function updateWakeUI(message) {
   if (wakeBtn) {
@@ -1192,48 +1343,148 @@ document.querySelectorAll('[data-prompt]').forEach(button => button.addEventList
   input.dispatchEvent(new Event('input'));
 }));
 
-// ===== ORBS INITIALIZATION =====
-let orbInstance = null;
-
-function initOrbs() {
-  const container = document.getElementById('jarvis-core-container');
-  if (!container) return;
-
-  orbInstance = new Orbs(container, {
-    colorPrimary: '#00ffff',
-    colorSecondary: '#ff00ff',
-    speed: 0.5,
-    complexity: 5
-  });
-}
+// ===== ORB (canvas, no external library) =====
+const ORB_STATES = {
+  IDLE: { color: [0, 255, 255], speed: 0.5, pulse: 0.04 },
+  LISTENING: { color: [0, 255, 120], speed: 1.5, pulse: 0.08 },
+  THINKING: { color: [255, 165, 0], speed: 3, pulse: 0.1 },
+  SPEAKING: { color: [0, 190, 255], speed: 1.2, pulse: 0.12 },
+  ERROR: { color: [255, 60, 60], speed: 0.8, pulse: 0.05 }
+};
+let orbState = 'IDLE';
+let orbCurrent = { color: [...ORB_STATES.IDLE.color], speed: ORB_STATES.IDLE.speed, pulse: ORB_STATES.IDLE.pulse };
+let orbCanvas = null;
+let orbCtx = null;
+let orbTime = 0;
+let orbLast = 0;
+const ORB_SIZE = 150;
 
 function setJarvisVisualState(state) {
-  if (!orbInstance) return;
-
-  switch (state) {
-    case 'IDLE':
-      orbInstance.setSpeed(0.5);
-      orbInstance.setColor('#00ffff');
-      break;
-    case 'LISTENING':
-      orbInstance.setSpeed(1.5);
-      orbInstance.setColor('#00ff00');
-      break;
-    case 'THINKING':
-      orbInstance.setSpeed(3.0);
-      orbInstance.setColor('#ffa500');
-      break;
-    case 'SPEAKING':
-      orbInstance.setSpeed(1.0);
-      orbInstance.setColor('#00ccff');
-      break;
-    case 'ERROR':
-      orbInstance.setColor('#ff0000');
-      break;
-  }
+  if (ORB_STATES[state]) orbState = state;
 }
 
-window.addEventListener('load', () => {
-  initOrbs();
-  setJarvisVisualState('IDLE');
+function initOrb() {
+  const container = document.getElementById('jarvis-core-container');
+  if (!container || orbCanvas) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  orbCanvas = document.createElement('canvas');
+  orbCanvas.width = ORB_SIZE * dpr;
+  orbCanvas.height = ORB_SIZE * dpr;
+  orbCanvas.style.width = ORB_SIZE + 'px';
+  orbCanvas.style.height = ORB_SIZE + 'px';
+  orbCtx = orbCanvas.getContext('2d');
+  orbCtx.scale(dpr, dpr);
+  container.appendChild(orbCanvas);
+  orbLast = performance.now();
+  requestAnimationFrame(drawOrb);
+}
+
+function drawOrb(now) {
+  requestAnimationFrame(drawOrb);
+  if (document.hidden || !orbCtx) { orbLast = now; return; }
+  const dt = Math.min(0.05, (now - orbLast) / 1000);
+  orbLast = now;
+  const target = ORB_STATES[orbState];
+  const k = Math.min(1, dt * 4);
+  for (let i = 0; i < 3; i++) orbCurrent.color[i] += (target.color[i] - orbCurrent.color[i]) * k;
+  orbCurrent.speed += (target.speed - orbCurrent.speed) * k;
+  orbCurrent.pulse += (target.pulse - orbCurrent.pulse) * k;
+  orbTime += dt * orbCurrent.speed;
+
+  const c = ORB_SIZE / 2;
+  const [r, g, b] = orbCurrent.color.map(Math.round);
+  const rgb = r + ',' + g + ',' + b;
+  const ctx = orbCtx;
+  ctx.clearRect(0, 0, ORB_SIZE, ORB_SIZE);
+
+  const radius = 40 * (1 + Math.sin(orbTime * 2) * orbCurrent.pulse);
+  const glow = ctx.createRadialGradient(c, c, 3, c, c, radius * 1.7);
+  glow.addColorStop(0, 'rgba(255,255,255,0.95)');
+  glow.addColorStop(0.25, 'rgba(' + rgb + ',0.9)');
+  glow.addColorStop(1, 'rgba(' + rgb + ',0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(c, c, radius * 1.7, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.lineWidth = 1.5;
+  for (let ring = 0; ring < 3; ring++) {
+    ctx.strokeStyle = 'rgba(' + rgb + ',' + (0.65 - ring * 0.18) + ')';
+    ctx.beginPath();
+    ctx.ellipse(c, c, 58 - ring * 8, 22 + ring * 6, orbTime * (0.6 + ring * 0.3) + ring * 1.1, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = 'rgba(' + rgb + ',0.9)';
+  for (let i = 0; i < 14; i++) {
+    const angle = orbTime * (0.8 + (i % 3) * 0.3) + i * (Math.PI * 2 / 14);
+    const dist = 50 + Math.sin(orbTime * 1.5 + i) * 8;
+    ctx.beginPath();
+    ctx.arc(c + Math.cos(angle) * dist, c + Math.sin(angle) * dist, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  orbCanvas.style.boxShadow = '0 0 30px rgba(' + rgb + ',0.4)';
+}
+
+window.addEventListener('load', initOrb);
+
+// ===== SETTINGS FIELDS =====
+const apiKeyInput = document.getElementById('api-key-input');
+const modelInput = document.getElementById('model-input');
+const nameInput = document.getElementById('name-input');
+const voiceLangSelect = document.getElementById('voice-lang-select');
+const saveSettingsBtn = document.getElementById('save-settings');
+const testKeyBtn = document.getElementById('test-key');
+const settingsStatus = document.getElementById('settings-status');
+const profileName = document.getElementById('profile-name');
+const profileAvatar = document.getElementById('profile-avatar');
+
+function showSettingsStatus(text, ok) {
+  if (!settingsStatus) return;
+  settingsStatus.textContent = text;
+  settingsStatus.dataset.ok = ok ? 'true' : 'false';
+}
+
+function applyProfile() {
+  const name = SETTINGS.userName || 'Boss';
+  if (profileName) profileName.textContent = name;
+  if (profileAvatar) profileAvatar.textContent = name.charAt(0).toUpperCase();
+}
+
+function fillSettingsFields() {
+  if (apiKeyInput) apiKeyInput.value = SETTINGS.apiKey || '';
+  if (modelInput) modelInput.value = SETTINGS.model || '';
+  if (nameInput) nameInput.value = SETTINGS.userName || '';
+  if (voiceLangSelect) voiceLangSelect.value = SETTINGS.voiceLang || 'en-IN';
+  showSettingsStatus('', true);
+}
+
+function readSettingsFields() {
+  if (apiKeyInput) SETTINGS.apiKey = apiKeyInput.value.trim();
+  if (modelInput) SETTINGS.model = modelInput.value.trim();
+  if (nameInput) SETTINGS.userName = nameInput.value.trim() || 'Ganesh';
+  if (voiceLangSelect) SETTINGS.voiceLang = voiceLangSelect.value;
+  saveSettings();
+  discoveredModels = null;
+  if (rec) rec.lang = SETTINGS.voiceLang || 'en-IN';
+  applyProfile();
+}
+
+if (saveSettingsBtn) saveSettingsBtn.addEventListener('click', () => {
+  readSettingsFields();
+  showSettingsStatus('Saved ✓', true);
 });
+
+if (testKeyBtn) testKeyBtn.addEventListener('click', async () => {
+  readSettingsFields();
+  showSettingsStatus('Testing...', true);
+  try {
+    await requestGemini([{ role: 'user', parts: [{ text: 'Reply with just: OK' }] }], '');
+    showSettingsStatus('Connected ✓ model: ' + lastGeminiModel, true);
+  } catch (e) {
+    showSettingsStatus(e?.message || 'Test failed.', false);
+  }
+});
+
+applyProfile();
+if (!SETTINGS.apiKey) setTimeout(openSettings, 600);
